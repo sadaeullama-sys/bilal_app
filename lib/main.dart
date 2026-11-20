@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
+import 'package:crypto/crypto.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:pdf/pdf.dart';
 import 'package:printing/printing.dart';
@@ -23,14 +24,15 @@ class AppDb {
   Future<Database> get database async {
     if (_db != null) return _db!;
     final path = p.join(await getDatabasesPath(), 'veterinary_care_pro.db');
-    _db = await openDatabase(path, version: 3, onCreate: (db, version) async {
+    _db = await openDatabase(path, version: 4, onCreate: (db, version) async {
       await db.execute('''CREATE TABLE patients(
         id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
         phone TEXT, animal TEXT NOT NULL, tag TEXT, age TEXT,
         complaint TEXT, notes TEXT, created_at TEXT NOT NULL)''');
       await db.execute('''CREATE TABLE medicines(
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        barcode TEXT, company TEXT, batch TEXT, expiry TEXT, purchase REAL NOT NULL DEFAULT 0,
+        barcode TEXT, company TEXT, batch TEXT, expiry TEXT, category TEXT,
+        unit TEXT, purchase REAL NOT NULL DEFAULT 0,
         price REAL NOT NULL DEFAULT 0, stock REAL NOT NULL DEFAULT 0)''');
       await db.execute('''CREATE TABLE sales(
         id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT, customer_phone TEXT,
@@ -56,6 +58,10 @@ class AppDb {
       if (oldVersion < 3) {
         await db.execute('ALTER TABLE sales ADD COLUMN customer_phone TEXT');
       }
+      if (oldVersion < 4) {
+        await db.execute('ALTER TABLE medicines ADD COLUMN category TEXT');
+        await db.execute('ALTER TABLE medicines ADD COLUMN unit TEXT');
+      }
     });
     return _db!;
   }
@@ -69,6 +75,35 @@ class AppDb {
       'SELECT COALESCE(SUM($column),0) AS total FROM $table');
     return (rows.first['total'] as num).toDouble();
   }
+}
+
+String passwordHash(String value) => sha256.convert(utf8.encode(value)).toString();
+
+Map<String, String> parseGs1Barcode(String raw) {
+  final value = raw.replaceAll(RegExp(r'\s+'), '');
+  final result = <String, String>{'barcode': raw};
+  final gtin = RegExp(r'(?:01)?(\d{14})').firstMatch(value);
+  if (gtin != null) result['gtin'] = gtin.group(1)!;
+  final expiry = RegExp(r'(?:17)(\d{6})').firstMatch(value);
+  if (expiry != null) {
+    final d = expiry.group(1)!;
+    final yy = int.parse(d.substring(0, 2));
+    final year = yy >= 50 ? 1900 + yy : 2000 + yy;
+    final month = int.parse(d.substring(2, 4));
+    var day = int.parse(d.substring(4, 6));
+    if (month >= 1 && month <= 12 && day >= 0 && day <= 31) {
+      if (day == 0) day = DateTime(year, month + 1, 0).day;
+      final parsedDate = DateTime(year, month, day);
+      if (parsedDate.month == month && parsedDate.day == day) {
+        result['expiry'] = DateFormat('yyyy-MM-dd').format(parsedDate);
+      }
+    }
+  }
+  final lot = RegExp(r'(?:10)([A-Za-z0-9./-]{1,20})').firstMatch(value);
+  if (lot != null) result['batch'] = lot.group(1)!;
+  final serial = RegExp(r'(?:21)([A-Za-z0-9./-]{1,20})').firstMatch(value);
+  if (serial != null) result['serial'] = serial.group(1)!;
+  return result;
 }
 
 String money(num n) => 'Rs. ${NumberFormat('#,##0.##').format(n)}';
@@ -105,6 +140,9 @@ class _LoginPageState extends State<LoginPage> {
   Future<void> _loadUsername() async {
     final prefs = await SharedPreferences.getInstance();
     user.text = prefs.getString('login_username') ?? 'Admin';
+    if (prefs.getString('login_password_hash') == null) {
+      await prefs.setString('login_password_hash', passwordHash('1234'));
+    }
     if (mounted) setState(() {});
   }
   @override
@@ -137,7 +175,9 @@ class _LoginPageState extends State<LoginPage> {
             onPressed: () async {
               final prefs = await SharedPreferences.getInstance();
               final savedUser = prefs.getString('login_username') ?? 'Admin';
-              if (user.text.trim() == savedUser && pass.text == '1234') {
+              final savedHash = prefs.getString('login_password_hash') ?? passwordHash('1234');
+              if (user.text.trim() == savedUser &&
+                  passwordHash(pass.text) == savedHash) {
                 if (!mounted) return;
                 Navigator.pushReplacement(context,
                   MaterialPageRoute(builder: (_) => const HomePage()));
@@ -320,52 +360,175 @@ class MedicinesPage extends StatefulWidget {
   @override State<MedicinesPage> createState() => _MedicinesPageState();
 }
 class _MedicinesPageState extends State<MedicinesPage> {
-  Future<void> addMedicine() async {
-    final name = TextEditingController(), barcode = TextEditingController(),
-      company = TextEditingController(), batch = TextEditingController(), expiry = TextEditingController(),
-      purchase = TextEditingController(text: '0'), price = TextEditingController(text: '0'),
-      stock = TextEditingController(text: '0');
+  final search = TextEditingController();
+
+  Future<void> editMedicine([Map<String, dynamic>? existing]) async {
+    final name = TextEditingController(text: existing?['name']?.toString() ?? '');
+    final barcode = TextEditingController(text: existing?['barcode']?.toString() ?? '');
+    final company = TextEditingController(text: existing?['company']?.toString() ?? '');
+    final batch = TextEditingController(text: existing?['batch']?.toString() ?? '');
+    final expiry = TextEditingController(text: existing?['expiry']?.toString() ?? '');
+    final category = TextEditingController(text: existing?['category']?.toString() ?? 'General');
+    final unit = TextEditingController(text: existing?['unit']?.toString() ?? 'Piece');
+    final purchase = TextEditingController(text: (existing?['purchase'] ?? 0).toString());
+    final price = TextEditingController(text: (existing?['price'] ?? 0).toString());
+    final stock = TextEditingController(text: (existing?['stock'] ?? 0).toString());
+
     final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
-      title: const Text('Add Medicine / نئی دوائی'),
-      content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        field(name,'Medicine name / دوائی'),
-        Row(children: [Expanded(child: field(barcode,'Barcode / بارکوڈ')),
-          IconButton(tooltip: 'Scan barcode', icon: const Icon(Icons.qr_code_scanner),
-            onPressed: () async {
-              final code = await Navigator.push<String>(context,
-                MaterialPageRoute(builder: (_) => const BarcodeScannerPage()));
-              if (code != null) barcode.text = code;
-            })]),
-        field(company,'Company / کمپنی'),
-        field(batch,'Batch number / بیچ نمبر'), field(expiry,'Expiry YYYY-MM-DD'),
-        field(purchase,'Purchase price / خرید قیمت', keyboard: TextInputType.number),
-        field(price,'Sale price / فروخت قیمت', keyboard: TextInputType.number),
-        field(stock,'Stock quantity / مقدار', keyboard: TextInputType.number),
-      ])),
-      actions: [TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
-        FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Save'))]));
+      title: Text(existing == null ? 'Add Medicine / نئی دوائی' : 'Edit Medicine / دوائی تبدیل کریں'),
+      content: SizedBox(width: 440, child: SingleChildScrollView(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          field(name, 'Medicine name / دوائی کا نام'),
+          Row(children: [
+            Expanded(child: field(barcode, 'Barcode / بارکوڈ')),
+            IconButton(tooltip: 'Scan barcode', icon: const Icon(Icons.qr_code_scanner),
+              onPressed: () async {
+                final scanned = await Navigator.push<String>(context,
+                  MaterialPageRoute(builder: (_) => const BarcodeScannerPage()));
+                if (scanned != null) {
+                  barcode.text = scanned;
+                  final parsed = parseGs1Barcode(scanned);
+                  if (parsed['batch'] != null) batch.text = parsed['batch']!;
+                  if (parsed['expiry'] != null) expiry.text = parsed['expiry']!;
+                  final db = await AppDb.instance.database;
+                  final candidates = <String>[scanned];
+                  if (parsed['gtin'] != null) candidates.add(parsed['gtin']!);
+                  for (final value in candidates) {
+                    final found = await db.query('medicines',
+                      where: 'barcode = ?', whereArgs: [value], limit: 1);
+                    if (found.isNotEmpty) {
+                      final m = found.first;
+                      name.text = (m['name'] ?? '').toString();
+                      company.text = (m['company'] ?? '').toString();
+                      category.text = (m['category'] ?? category.text).toString();
+                      unit.text = (m['unit'] ?? unit.text).toString();
+                      batch.text = (m['batch'] ?? batch.text).toString();
+                      expiry.text = (m['expiry'] ?? expiry.text).toString();
+                      purchase.text = (m['purchase'] ?? 0).toString();
+                      price.text = (m['price'] ?? 0).toString();
+                      stock.text = (m['stock'] ?? 0).toString();
+                      break;
+                    }
+                  }
+                }
+              })
+          ]),
+          field(company, 'Company / کمپنی'),
+          field(category, 'Category / قسم (Injection, Tablet, Vaccine...)'),
+          field(unit, 'Unit / پیمانہ (Bottle, Pack, Piece...)'),
+          field(batch, 'Batch / Lot Number / بیچ نمبر'),
+          Row(children: [
+            Expanded(child: TextField(controller: expiry, readOnly: true,
+              decoration: const InputDecoration(labelText: 'Expiry Date / میعاد ختم',
+                border: OutlineInputBorder(), suffixIcon: Icon(Icons.calendar_month)))),
+            IconButton(icon: const Icon(Icons.calendar_month), tooltip: 'Choose expiry',
+              onPressed: () async {
+                final initial = DateTime.tryParse(expiry.text) ?? DateTime.now();
+                final picked = await showDatePicker(context: ctx, initialDate: initial,
+                  firstDate: DateTime(2000), lastDate: DateTime(2100));
+                if (picked != null) expiry.text = DateFormat('yyyy-MM-dd').format(picked);
+              })
+          ]),
+          field(purchase, 'Purchase price / خرید قیمت', keyboard: TextInputType.number),
+          field(price, 'Sale price / فروخت قیمت', keyboard: TextInputType.number),
+          field(stock, 'Stock quantity / مقدار', keyboard: TextInputType.number),
+        ]))),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save'))
+      ]));
     if (ok == true && name.text.trim().isNotEmpty) {
-      await AppDb.instance.add('medicines', {'name':name.text.trim(),
-        'barcode':barcode.text.trim(),'company':company.text.trim(),'batch':batch.text.trim(),'expiry':expiry.text.trim(),
-        'purchase':double.tryParse(purchase.text) ?? 0,'price':double.tryParse(price.text) ?? 0,
-        'stock':double.tryParse(stock.text) ?? 0});
-      setState(() {});
+      final values = <String, Object?>{
+        'name': name.text.trim(), 'barcode': barcode.text.trim(),
+        'company': company.text.trim(), 'category': category.text.trim(),
+        'unit': unit.text.trim(), 'batch': batch.text.trim(), 'expiry': expiry.text.trim(),
+        'purchase': double.tryParse(purchase.text) ?? 0,
+        'price': double.tryParse(price.text) ?? 0,
+        'stock': double.tryParse(stock.text) ?? 0,
+      };
+      final db = await AppDb.instance.database;
+      if (existing == null) {
+        await db.insert('medicines', values);
+      } else {
+        await db.update('medicines', values, where: 'id = ?', whereArgs: [existing['id']]);
+      }
+      if (mounted) setState(() {});
     }
   }
+
+  Future<void> deleteMedicine(Map<String, dynamic> item) async {
+    final confirm = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: const Text('Delete medicine? / دوائی حذف کریں؟'),
+      content: Text('Delete ${item['name']} from medicine catalogue?'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true),
+          style: FilledButton.styleFrom(backgroundColor: Colors.red),
+          child: const Text('Delete'))
+      ]));
+    if (confirm == true) {
+      final db = await AppDb.instance.database;
+      await db.delete('medicines', where: 'id = ?', whereArgs: [item['id']]);
+      if (mounted) setState(() {});
+    }
+  }
+
   @override Widget build(BuildContext context) => Scaffold(
-    floatingActionButton: FloatingActionButton.extended(onPressed:addMedicine,
-      icon:const Icon(Icons.add),label:const Text('Add Medicine')),
-    body: FutureBuilder(future:AppDb.instance.all('medicines'),builder:(context,snap){
-      final rows=snap.data??[];
-      if(rows.isEmpty) return const Center(child:Text('No medicines added / دوائیاں شامل کریں'));
-      return ListView.builder(itemCount:rows.length,itemBuilder:(_,i){
-        final r=rows[i]; final low=(r['stock'] as num)<=5;
-        return Card(child:ListTile(leading:const CircleAvatar(child:Icon(Icons.medication)),
-          title:Text('${r['name']} (${r['company']})'),
-          subtitle:Text('Barcode: ${r['barcode'] ?? ''} • Batch: ${r['batch']} • Expiry: ${r['expiry']}\\nStock: ${r['stock']} • ${money(r['price'] as num)}'),
-          isThreeLine:true,trailing:low?const Icon(Icons.warning,color:Colors.orange):null));
-      });
-    }));
+    floatingActionButton: FloatingActionButton.extended(onPressed: () => editMedicine(),
+      icon: const Icon(Icons.add), label: const Text('Add Medicine / نئی دوائی')),
+    body: Column(children: [
+      Padding(padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+        child: TextField(controller: search, onChanged: (_) => setState(() {}),
+          decoration: InputDecoration(
+            hintText: 'Search name, company, barcode, batch...',
+            prefixIcon: const Icon(Icons.search),
+            suffixIcon: IconButton(icon: const Icon(Icons.clear),
+              onPressed: () { search.clear(); setState(() {}); }),
+            border: const OutlineInputBorder()))),
+      Expanded(child: FutureBuilder(future: AppDb.instance.all('medicines'),
+        builder: (context, snap) {
+          final allRows = snap.data ?? [];
+          final q = search.text.trim().toLowerCase();
+          final rows = allRows.where((r) =>
+            ['name','company','barcode','batch','category'].any((k) =>
+              (r[k] ?? '').toString().toLowerCase().contains(q))).toList();
+          if (rows.isEmpty) return Center(child: Text(
+            allRows.isEmpty ? 'No medicines added / ابھی دوائیاں شامل نہیں' : 'No matching medicine found'));
+          return ListView.builder(padding: const EdgeInsets.fromLTRB(12, 8, 12, 90),
+            itemCount: rows.length, itemBuilder: (_, i) {
+              final r = Map<String, dynamic>.from(rows[i]);
+              final qty = (r['stock'] as num).toDouble();
+              final exp = DateTime.tryParse((r['expiry'] ?? '').toString());
+              final expired = exp != null && exp.isBefore(DateTime.now());
+              final low = qty <= 5;
+              return Card(child: ListTile(
+                leading: CircleAvatar(backgroundColor: expired ? Colors.red.shade100 :
+                  low ? Colors.orange.shade100 : Colors.green.shade100,
+                  child: Icon(Icons.medication, color: expired ? Colors.red :
+                    low ? Colors.orange : Colors.green)),
+                title: Text('${r['name']}'),
+                subtitle: Text(
+                  '${r['company'] ?? ''} • ${r['category'] ?? 'General'}\\n'
+                  'Code: ${r['barcode'] ?? '-'} • Batch: ${r['batch'] ?? '-'}\\n'
+                  'Expiry: ${r['expiry'] ?? '-'} • Stock: ${r['stock']} ${r['unit'] ?? ''}\\n'
+                  'Purchase: ${money(r['purchase'] as num)} • Sale: ${money(r['price'] as num)}',
+                  maxLines: 4),
+                isThreeLine: true,
+                trailing: PopupMenuButton<String>(
+                  onSelected: (v) {
+                    if (v == 'edit') editMedicine(r);
+                    if (v == 'delete') deleteMedicine(r);
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'edit', child: Text('Edit / تبدیل کریں')),
+                    PopupMenuItem(value: 'delete', child: Text('Delete / حذف کریں')),
+                  ]),
+                onTap: () => editMedicine(r),
+              ));
+            });
+        }))
+    ]),
+  );
 }
 
 class SalesPage extends StatefulWidget {
@@ -662,14 +825,20 @@ class SettingsPage extends StatefulWidget {
 }
 class _SettingsPageState extends State<SettingsPage> {
   final username = TextEditingController();
+  final currentPassword = TextEditingController();
+  final newPassword = TextEditingController();
+  final confirmPassword = TextEditingController();
   String message = '';
   @override void initState() { super.initState(); load(); }
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     username.text = prefs.getString('login_username') ?? 'Admin';
+    if (prefs.getString('login_password_hash') == null) {
+      await prefs.setString('login_password_hash', passwordHash('1234'));
+    }
     if (mounted) setState(() {});
   }
-  Future<void> save() async {
+  Future<void> saveUsername() async {
     if (username.text.trim().isEmpty) {
       setState(() => message = 'Username cannot be empty'); return;
     }
@@ -677,21 +846,55 @@ class _SettingsPageState extends State<SettingsPage> {
     await prefs.setString('login_username', username.text.trim());
     setState(() => message = 'Username saved successfully');
   }
+  Future<void> changePassword() async {
+    final prefs = await SharedPreferences.getInstance();
+    final oldHash = prefs.getString('login_password_hash') ?? passwordHash('1234');
+    if (passwordHash(currentPassword.text) != oldHash) {
+      setState(() => message = 'Current password is incorrect'); return;
+    }
+    if (newPassword.text.length < 6) {
+      setState(() => message = 'New password must be at least 6 characters'); return;
+    }
+    if (newPassword.text != confirmPassword.text) {
+      setState(() => message = 'New passwords do not match'); return;
+    }
+    await prefs.setString('login_password_hash', passwordHash(newPassword.text));
+    currentPassword.clear(); newPassword.clear(); confirmPassword.clear();
+    setState(() => message = 'Password changed successfully');
+  }
   @override Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('Settings / ترتیبات')),
     body: ListView(padding: const EdgeInsets.all(16), children: [
-      const Text('Login Username / لاگ ان صارف نام',
+      const Text('Change Username / صارف نام تبدیل کریں',
         style: TextStyle(fontWeight: FontWeight.bold)),
       const SizedBox(height: 8),
       TextField(controller: username, decoration: const InputDecoration(
         border: OutlineInputBorder(), prefixIcon: Icon(Icons.person))),
-      const SizedBox(height: 12),
-      FilledButton.icon(onPressed: save, icon: const Icon(Icons.save),
+      const SizedBox(height: 10),
+      FilledButton.icon(onPressed: saveUsername, icon: const Icon(Icons.save),
         label: const Text('Save Username / محفوظ کریں')),
+      const Divider(height: 32),
+      const Text('Change Password / پاس ورڈ تبدیل کریں',
+        style: TextStyle(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      TextField(controller: currentPassword, obscureText: true,
+        decoration: const InputDecoration(labelText: 'Current Password / موجودہ پاس ورڈ',
+          border: OutlineInputBorder())),
+      const SizedBox(height: 10),
+      TextField(controller: newPassword, obscureText: true,
+        decoration: const InputDecoration(labelText: 'New Password / نیا پاس ورڈ',
+          border: OutlineInputBorder())),
+      const SizedBox(height: 10),
+      TextField(controller: confirmPassword, obscureText: true,
+        decoration: const InputDecoration(labelText: 'Confirm New Password / دوبارہ نیا پاس ورڈ',
+          border: OutlineInputBorder())),
+      const SizedBox(height: 10),
+      FilledButton.icon(onPressed: changePassword, icon: const Icon(Icons.lock_reset),
+        label: const Text('Change Password / پاس ورڈ تبدیل کریں')),
       if (message.isNotEmpty) Padding(padding: const EdgeInsets.all(8),
         child: Text(message, style: const TextStyle(color: Colors.green))),
       const SizedBox(height: 16),
-      const Text('Demo password remains 1234 in this starter version.',
+      const Text('First installation default password: 1234. Change it immediately.',
         style: TextStyle(color: Colors.grey)),
     ]),
   );
