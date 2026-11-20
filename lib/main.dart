@@ -3,6 +3,11 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:pdf/pdf.dart';
+import 'package:printing/printing.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,7 +23,7 @@ class AppDb {
   Future<Database> get database async {
     if (_db != null) return _db!;
     final path = p.join(await getDatabasesPath(), 'veterinary_care_pro.db');
-    _db = await openDatabase(path, version: 2, onCreate: (db, version) async {
+    _db = await openDatabase(path, version: 3, onCreate: (db, version) async {
       await db.execute('''CREATE TABLE patients(
         id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
         phone TEXT, animal TEXT NOT NULL, tag TEXT, age TEXT,
@@ -28,7 +33,7 @@ class AppDb {
         barcode TEXT, company TEXT, batch TEXT, expiry TEXT, purchase REAL NOT NULL DEFAULT 0,
         price REAL NOT NULL DEFAULT 0, stock REAL NOT NULL DEFAULT 0)''');
       await db.execute('''CREATE TABLE sales(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, customer TEXT, customer_phone TEXT,
         description TEXT NOT NULL, total REAL NOT NULL,
         paid REAL NOT NULL, created_at TEXT NOT NULL)''');
       await db.execute('''CREATE TABLE sale_items(
@@ -47,6 +52,9 @@ class AppDb {
           medicine_id INTEGER NOT NULL, medicine_name TEXT NOT NULL,
           barcode TEXT, quantity REAL NOT NULL, unit_price REAL NOT NULL,
           line_total REAL NOT NULL)''');
+      }
+      if (oldVersion < 3) {
+        await db.execute('ALTER TABLE sales ADD COLUMN customer_phone TEXT');
       }
     });
     return _db!;
@@ -87,9 +95,18 @@ class LoginPage extends StatefulWidget {
   @override State<LoginPage> createState() => _LoginPageState();
 }
 class _LoginPageState extends State<LoginPage> {
-  final user = TextEditingController(text: 'Admin');
+  final user = TextEditingController();
   final pass = TextEditingController();
   String error = '';
+  @override void initState() {
+    super.initState();
+    _loadUsername();
+  }
+  Future<void> _loadUsername() async {
+    final prefs = await SharedPreferences.getInstance();
+    user.text = prefs.getString('login_username') ?? 'Admin';
+    if (mounted) setState(() {});
+  }
   @override
   Widget build(BuildContext context) => Scaffold(
     body: Center(child: SingleChildScrollView(child: Padding(
@@ -117,14 +134,24 @@ class _LoginPageState extends State<LoginPage> {
             child: Text(error, style: const TextStyle(color: Colors.red))),
           const SizedBox(height: 18),
           SizedBox(width: double.infinity, child: FilledButton(
-            onPressed: () {
-              if (user.text.trim() == 'Admin' && pass.text == '1234') {
+            onPressed: () async {
+              final prefs = await SharedPreferences.getInstance();
+              final savedUser = prefs.getString('login_username') ?? 'Admin';
+              if (user.text.trim() == savedUser && pass.text == '1234') {
+                if (!mounted) return;
                 Navigator.pushReplacement(context,
                   MaterialPageRoute(builder: (_) => const HomePage()));
-              } else { setState(() => error = 'Incorrect login. Demo password: 1234'); }
+              } else {
+                setState(() => error = 'Incorrect username or password');
+              }
             }, child: const Text('Login / داخل ہوں'))),
           const SizedBox(height: 8),
-          const Text('First login: Admin / 1234',
+          TextButton.icon(
+            onPressed: () => Navigator.push(context,
+              MaterialPageRoute(builder: (_) => const SettingsPage())),
+            icon: const Icon(Icons.manage_accounts),
+            label: const Text('Change Username / صارف نام تبدیل کریں')),
+          const Text('Demo password: 1234',
             style: TextStyle(color: Colors.grey, fontSize: 12)),
         ]),
       )),
@@ -144,9 +171,14 @@ class _HomePageState extends State<HomePage> {
       const MedicinesPage(), const SalesPage(), const ReportsPage()];
     return Scaffold(
       appBar: AppBar(title: Text('Veterinary Care Pro • ${titles[tab]}'),
-        actions: [IconButton(tooltip: 'Logout', icon: const Icon(Icons.logout),
-          onPressed: () => Navigator.pushReplacement(context,
-            MaterialPageRoute(builder: (_) => const LoginPage())))]),
+        actions: [
+          IconButton(tooltip: 'Settings', icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.push(context,
+              MaterialPageRoute(builder: (_) => const SettingsPage()))),
+          IconButton(tooltip: 'Logout', icon: const Icon(Icons.logout),
+            onPressed: () => Navigator.pushReplacement(context,
+              MaterialPageRoute(builder: (_) => const LoginPage())))
+        ]),
       body: pages[tab],
       bottomNavigationBar: NavigationBar(selectedIndex: tab,
         onDestinationSelected: (v) => setState(() => tab = v),
@@ -236,7 +268,19 @@ class _PatientsPageState extends State<PatientsPage> {
     final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
       title: const Text('Add Animal Patient / نیا مریض'),
       content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
-        field(owner, 'Owner name / مالک کا نام'),
+        Row(children: [
+          Expanded(child: field(owner, 'Owner name / مالک کا نام')),
+          IconButton(tooltip: 'Scan customer QR', icon: const Icon(Icons.qr_code_scanner),
+            onPressed: () async {
+              final raw = await Navigator.push<String>(context,
+                MaterialPageRoute(builder: (_) => const BarcodeScannerPage()));
+              if (raw != null) {
+                final details = parseCustomerQr(raw);
+                if (details['name'] != null) owner.text = details['name']!;
+                if (details['phone'] != null) phone.text = details['phone']!;
+              }
+            })
+        ]),
         field(phone, 'Phone / موبائل'),
         field(animal, 'Animal type / جانور کی قسم'),
         field(tag, 'Tag or ID / شناختی نمبر'),
@@ -330,6 +374,7 @@ class SalesPage extends StatefulWidget {
 }
 class _SalesPageState extends State<SalesPage> {
   final customer = TextEditingController();
+  final customerPhone = TextEditingController();
   final paid = TextEditingController(text: '0');
   final Map<int, Map<String, dynamic>> cart = {};
 
@@ -365,7 +410,7 @@ class _SalesPageState extends State<SalesPage> {
       cart[id] = {'id': id, 'name': medicine['name'],
         'barcode': medicine['barcode'] ?? '',
         'price': (medicine['price'] as num).toDouble(),
-        'qty': qty, 'stock': stock};
+        'qty': qty, 'stock': stock, 'custom': medicine['custom'] == true};
     });
   }
 
@@ -382,6 +427,32 @@ class _SalesPageState extends State<SalesPage> {
       ])));
   }
 
+  Future<void> addCustomItem() async {
+    final name = TextEditingController();
+    final price = TextEditingController(text: '0');
+    final qty = TextEditingController(text: '1');
+    final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: const Text('Add service or item / سروس یا سامان'),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        field(name, 'Description / تفصیل'),
+        field(price, 'Unit price Rs. / قیمت', keyboard: TextInputType.number),
+        field(qty, 'Quantity / تعداد', keyboard: TextInputType.number),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Add')),
+      ]));
+    final p = double.tryParse(price.text) ?? -1;
+    final q = double.tryParse(qty.text) ?? 0;
+    if (ok == true && name.text.trim().isNotEmpty && p >= 0 && q > 0) {
+      setState(() {
+        final key = -DateTime.now().microsecondsSinceEpoch;
+        cart[key] = {'id': key, 'name': name.text.trim(), 'barcode': '',
+          'price': p, 'qty': q, 'stock': q, 'custom': true};
+      });
+    }
+  }
+
   Future<void> checkout() async {
     if (cart.isEmpty) return;
     final paidAmount = double.tryParse(paid.text) ?? 0;
@@ -391,29 +462,41 @@ class _SalesPageState extends State<SalesPage> {
       return;
     }
     final db = await AppDb.instance.database;
+    int savedSaleId = 0;
     await db.transaction((txn) async {
       final saleId = await txn.insert('sales', {
-        'customer': customer.text.trim(), 'description': 'Medicine sale',
+        'customer': customer.text.trim(), 'customer_phone': customerPhone.text.trim(),
+        'description': 'Medicine sale',
         'total': total, 'paid': paidAmount,
         'created_at': DateTime.now().toIso8601String()
       });
+      savedSaleId = saleId;
       for (final item in cart.values) {
         final qty = item['qty'] as double;
         final lineTotal = qty * (item['price'] as double);
         await txn.insert('sale_items', {
-          'sale_id': saleId, 'medicine_id': item['id'],
+          'sale_id': saleId, 'medicine_id': item['custom'] == true ? 0 : item['id'],
           'medicine_name': item['name'], 'barcode': item['barcode'],
           'quantity': qty, 'unit_price': item['price'],
           'line_total': lineTotal
         });
-        await txn.rawUpdate('UPDATE medicines SET stock = stock - ? WHERE id = ?',
-          [qty, item['id']]);
+        if (item['custom'] != true) {
+          await txn.rawUpdate('UPDATE medicines SET stock = stock - ? WHERE id = ?',
+            [qty, item['id']]);
+        }
       }
     });
     if (!mounted) return;
-    setState(() { cart.clear(); customer.clear(); paid.text = '0'; });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Sale saved and stock updated / فروخت محفوظ ہوگئی')));
+    final invoiceItems = cart.values.map((e) => Map<String, dynamic>.from(e)).toList();
+    final invoiceCustomer = customer.text.trim();
+    final invoicePhone = customerPhone.text.trim();
+    final invoiceTotal = total;
+    final invoicePaid = paidAmount;
+    setState(() { cart.clear(); customer.clear(); customerPhone.clear(); paid.text = '0'; });
+    await createInvoicePdf(savedSaleId, invoiceCustomer, invoicePhone,
+      invoiceItems, invoiceTotal, invoicePaid);
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Sale saved. Invoice opened for print/share.')));
   }
 
   @override Widget build(BuildContext context) => Scaffold(
@@ -421,11 +504,29 @@ class _SalesPageState extends State<SalesPage> {
       onPressed: scanAndAdd, icon: const Icon(Icons.qr_code_scanner),
       label: const Text('Scan Medicine')),
     body: ListView(padding: const EdgeInsets.all(16), children: [
-      TextField(controller: customer, decoration: const InputDecoration(
-        labelText: 'Customer / کسٹمر', border: OutlineInputBorder())),
+      Row(children: [
+        Expanded(child: TextField(controller: customer, decoration: const InputDecoration(
+          labelText: 'Customer name / کسٹمر کا نام', border: OutlineInputBorder()))),
+        IconButton(tooltip: 'Scan customer QR', icon: const Icon(Icons.qr_code_scanner),
+          onPressed: () async {
+            final raw = await Navigator.push<String>(context,
+              MaterialPageRoute(builder: (_) => const BarcodeScannerPage()));
+            if (raw != null) {
+              final details = parseCustomerQr(raw);
+              if (details['name'] != null) customer.text = details['name']!;
+              if (details['phone'] != null) customerPhone.text = details['phone']!;
+            }
+          })
+      ]),
+      const SizedBox(height: 8),
+      TextField(controller: customerPhone, keyboardType: TextInputType.phone,
+        decoration: const InputDecoration(labelText: 'Customer phone / موبائل نمبر',
+          border: OutlineInputBorder())),
       const SizedBox(height: 10),
       OutlinedButton.icon(onPressed: selectMedicine,
         icon: const Icon(Icons.add), label: const Text('Add medicine manually')),
+      OutlinedButton.icon(onPressed: addCustomItem,
+        icon: const Icon(Icons.medical_services), label: const Text('Add service / other item')),
       const SizedBox(height: 8),
       if (cart.isEmpty) const Padding(padding: EdgeInsets.all(24),
         child: Center(child: Text('Scan a medicine barcode to add it to sale'))),
@@ -439,7 +540,7 @@ class _SalesPageState extends State<SalesPage> {
           }), icon: const Icon(Icons.remove_circle_outline)),
           IconButton(onPressed: () => addMedicine({
             'id': item['id'], 'name': item['name'], 'barcode': item['barcode'],
-            'price': item['price'], 'stock': item['stock']
+            'price': item['price'], 'stock': item['stock'], 'custom': item['custom'] == true
           }), icon: const Icon(Icons.add_circle_outline)),
         ])))),
       const Divider(),
@@ -483,6 +584,115 @@ class _BarcodeScannerPageState extends State<BarcodeScannerPage> {
         child: Text('Place the barcode inside the frame',
           textAlign: TextAlign.center,
           style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
+    ]),
+  );
+}
+
+
+Map<String, String> parseCustomerQr(String raw) {
+  final result = <String, String>{};
+  try {
+    final data = jsonDecode(raw);
+    if (data is Map) {
+      final name = data['name'] ?? data['fullName'] ?? data['customer'];
+      final phone = data['phone'] ?? data['mobile'] ?? data['tel'];
+      if (name != null) result['name'] = name.toString();
+      if (phone != null) result['phone'] = phone.toString();
+    }
+  } catch (_) {}
+  if (result.isEmpty) {
+    final nameMatch = RegExp(r'(?im)^(?:name|fn|customer)\s*[:=]\s*(.+)$').firstMatch(raw);
+    final phoneMatch = RegExp(r'(?im)^(?:tel|phone|mobile)\s*[:=]\s*([+0-9 -]+)$').firstMatch(raw);
+    if (nameMatch != null) result['name'] = nameMatch.group(1)!.trim();
+    if (phoneMatch != null) result['phone'] = phoneMatch.group(1)!.trim();
+    if (raw.toUpperCase().contains('BEGIN:VCARD')) {
+      final n = RegExp(r'(?im)^FN[^:]*:(.+)$').firstMatch(raw);
+      final t = RegExp(r'(?im)^TEL[^:]*:(.+)$').firstMatch(raw);
+      if (n != null) result['name'] = n.group(1)!.trim();
+      if (t != null) result['phone'] = t.group(1)!.trim();
+    }
+  }
+  return result;
+}
+
+Future<void> createInvoicePdf(int saleId, String customer, String phone,
+    List<Map<String, dynamic>> items, double total, double paid) async {
+  final doc = pw.Document();
+  final date = DateFormat('dd MMM yyyy  hh:mm a').format(DateTime.now());
+  final rows = items.map((item) {
+    final qty = item['qty'] as double;
+    final price = item['price'] as double;
+    return [
+      item['name'].toString(), qty.toString(), money(price), money(qty * price)
+    ];
+  }).toList();
+  doc.addPage(pw.Page(pageFormat: PdfPageFormat.a4, build: (context) =>
+    pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+      pw.Center(child: pw.Text('VETERINARY CARE PRO',
+        style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold))),
+      pw.Center(child: pw.Text('Clinic & Medicine Shop')),
+      pw.SizedBox(height: 18),
+      pw.Text('INVOICE / RECEIPT', style: pw.TextStyle(
+        fontSize: 16, fontWeight: pw.FontWeight.bold)),
+      pw.Text('Invoice No: $saleId'),
+      pw.Text('Date: $date'),
+      pw.Text('Customer: ${customer.isEmpty ? "Walk-in Customer" : customer}'),
+      pw.Text('Phone: $phone'),
+      pw.SizedBox(height: 14),
+      pw.Table.fromTextArray(headers: ['Item / Service', 'Qty', 'Rate', 'Amount'],
+        data: rows),
+      pw.Spacer(),
+      pw.Align(alignment: pw.Alignment.centerRight, child: pw.Column(
+        crossAxisAlignment: pw.CrossAxisAlignment.end, children: [
+          pw.Text('Total: ${money(total)}'),
+          pw.Text('Received: ${money(paid)}'),
+          pw.Text('Balance: ${money(total - paid)}',
+            style: pw.TextStyle(fontWeight: pw.FontWeight.bold)),
+        ])),
+      pw.SizedBox(height: 30),
+      pw.Center(child: pw.Text('Thank you for your business')),
+    ])));
+  await Printing.layoutPdf(onLayout: (_) async => doc.save(),
+    name: 'Veterinary_Invoice_$saleId.pdf');
+}
+
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+  @override State<SettingsPage> createState() => _SettingsPageState();
+}
+class _SettingsPageState extends State<SettingsPage> {
+  final username = TextEditingController();
+  String message = '';
+  @override void initState() { super.initState(); load(); }
+  Future<void> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    username.text = prefs.getString('login_username') ?? 'Admin';
+    if (mounted) setState(() {});
+  }
+  Future<void> save() async {
+    if (username.text.trim().isEmpty) {
+      setState(() => message = 'Username cannot be empty'); return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('login_username', username.text.trim());
+    setState(() => message = 'Username saved successfully');
+  }
+  @override Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Settings / ترتیبات')),
+    body: ListView(padding: const EdgeInsets.all(16), children: [
+      const Text('Login Username / لاگ ان صارف نام',
+        style: TextStyle(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      TextField(controller: username, decoration: const InputDecoration(
+        border: OutlineInputBorder(), prefixIcon: Icon(Icons.person))),
+      const SizedBox(height: 12),
+      FilledButton.icon(onPressed: save, icon: const Icon(Icons.save),
+        label: const Text('Save Username / محفوظ کریں')),
+      if (message.isNotEmpty) Padding(padding: const EdgeInsets.all(8),
+        child: Text(message, style: const TextStyle(color: Colors.green))),
+      const SizedBox(height: 16),
+      const Text('Demo password remains 1234 in this starter version.',
+        style: TextStyle(color: Colors.grey)),
     ]),
   );
 }
