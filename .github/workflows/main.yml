@@ -24,20 +24,21 @@ jobs:
       - name: Accept Android licenses
         run: yes | flutter doctor --android-licenses
       - name: Generate Android platform files
-        run: flutter create . --platforms=android
+        run: flutter create . --project-name veterinary_care_pro --platforms=android
       - name: Add camera permission for barcode scanner
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
           p = Path('android/app/src/main/AndroidManifest.xml')
-          s = p.read_text()
-          if 'android.permission.CAMERA' not in s:
-              lines = s.splitlines()
-              for i, line in enumerate(lines):
-                  if '<manifest' in line and line.rstrip().endswith('>'):
-                      lines.insert(i + 1, '    <uses-permission android:name="android.permission.CAMERA"/>')
-                      break
-              p.write_text('\\n'.join(lines) + '\\n')
+          text = p.read_text(encoding='utf-8')
+          if 'android.permission.CAMERA' not in text:
+              match = re.search(r'<manifest\b[^>]*>', text)
+              if not match:
+                  raise SystemExit('AndroidManifest.xml has no valid manifest opening tag')
+              permission = '\n    <uses-permission android:name="android.permission.CAMERA" />'
+              text = text[:match.end()] + permission + text[match.end():]
+              p.write_text(text, encoding='utf-8')
           PY
       - name: Get dependencies
         run: flutter pub get
