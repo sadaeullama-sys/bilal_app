@@ -1,0 +1,50 @@
+name: Build Veterinary Care Pro APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+      - name: Accept Android licenses
+        run: yes | flutter doctor --android-licenses
+      - name: Generate Android platform files
+        run: flutter create . --platforms=android
+      - name: Add camera permission for barcode scanner
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          if 'android.permission.CAMERA' not in s:
+              lines = s.splitlines()
+              for i, line in enumerate(lines):
+                  if '<manifest' in line and line.rstrip().endswith('>'):
+                      lines.insert(i + 1, '    <uses-permission android:name="android.permission.CAMERA"/>')
+                      break
+              p.write_text('\\n'.join(lines) + '\\n')
+          PY
+      - name: Get dependencies
+        run: flutter pub get
+      - name: Build release APK
+        run: flutter build apk --release
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: veterinary-care-pro-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
